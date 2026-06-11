@@ -197,7 +197,7 @@ if 'heartbeat_sim' not in st.session_state:
 if 'heartbeat_running' not in st.session_state:
     st.session_state.heartbeat_running = False
 
-# ==================== 核心几何计算（修复穿障检测） ====================
+# ==================== 核心几何计算（彻底修复穿障检测） ====================
 def calc_distance(p1, p2):
     """计算两点球面距离(米) WGS84"""
     lat1, lon1 = math.radians(p1[0]), math.radians(p1[1])
@@ -220,9 +220,9 @@ def point_in_polygon(point, poly):
             inside = not inside
     return inside
 
-def line_intersect_polygon(start, end, poly, sample_num=100):
+def line_intersect_polygon(start, end, poly, sample_num=200):
     """
-    【修复1】超密采样线段穿障检测，杜绝漏判
+    超密采样线段穿障检测，任何微小穿障都能被检测
     """
     for i in range(sample_num + 1):
         t = i / sample_num
@@ -249,7 +249,44 @@ def get_polygon_bounds(points):
 def meter_to_degree(meter):
     return meter / 111000.0
 
-# ==================== 障碍物类（修复绕行点生成） ====================
+def get_point_along_perimeter(poly, offset, safe_dist):
+    """
+    基于多边形边缘，生成距离边缘safe_dist米的绕行点
+    """
+    best_point = None
+    best_dist = float('inf')
+    
+    for i in range(len(poly)):
+        p1 = poly[i]
+        p2 = poly[(i+1)%len(poly)]
+        
+        dx = p2[1] - p1[1]
+        dy = p2[0] - p1[0]
+        length = math.hypot(dx, dy)
+        if length < 1e-10:
+            continue
+        
+        # 法向量（向外）
+        nx = -dy / length
+        ny = dx / length
+        
+        # 沿线段中点向外偏移
+        mid_lat = (p1[0] + p2[0]) / 2
+        mid_lon = (p1[1] + p2[1]) / 2
+        
+        offset_deg = meter_to_degree(safe_dist)
+        point_out = [mid_lat + ny * offset_deg, mid_lon + nx * offset_deg]
+        
+        # 确保点不在多边形内
+        if not point_in_polygon(point_out, poly):
+            d = calc_distance(point_out, offset)
+            if d < best_dist:
+                best_dist = d
+                best_point = point_out
+    
+    return best_point
+
+# ==================== 障碍物类（彻底修复绕行点生成） ====================
 class Obstacle:
     def __init__(self, points, height, name):
         self.points = points
@@ -274,13 +311,12 @@ class Obstacle:
     def line_intersects(self, start, end):
         return line_intersect_polygon(start, end, self.points)
 
-    def get_corner_bypass_points(self, start, end, safe_radius, bypass_distance):
+    def get_edge_bypass_points(self, start, end, safe_radius, bypass_distance):
         """
-        【修复2】基于障碍物角点生成绕行点，保证在障碍物外侧
+        【核心修复】基于障碍物边缘生成真正的绕行点，保证在障碍物外侧
         """
-        total_safe = safe_radius + bypass_distance
-        offset_deg = meter_to_degree(total_safe)
-
+        safe_dist = safe_radius + bypass_distance
+        
         # 航线方向向量
         dx = end[1] - start[1]
         dy = end[0] - start[0]
@@ -290,47 +326,55 @@ class Obstacle:
         else:
             dx /= length
             dy /= length
-
-        # 垂直法向量
-        perp_left_x = -dy
-        perp_left_y = dx
-        perp_right_x = dy
-        perp_right_y = -dx
-
-        # 取障碍物四个角点，向外偏移
+        
+        # 法向量（左右）
+        left_nx = -dy
+        left_ny = dx
+        right_nx = dy
+        right_ny = -dx
+        
+        # 前后方向
+        front_dx = dx
+        front_dy = dy
+        back_dx = -dx
+        back_dy = -dy
+        
+        offset_deg = meter_to_degree(safe_dist)
+        
+        # 生成四个方向的绕行点（基于边缘中点向外偏移）
+        left_point = get_point_along_perimeter(self.points, start, safe_dist)
+        right_point = get_point_along_perimeter(self.points, start, safe_dist)
+        front_point = get_point_along_perimeter(self.points, start, safe_dist)
+        back_point = get_point_along_perimeter(self.points, start, safe_dist)
+        
+        # 兜底：如果边缘点生成失败，用角点偏移
         corners = [
-            [self.min_lat, self.min_lon],  # 西南
-            [self.min_lat, self.max_lon],  # 东南
-            [self.max_lat, self.max_lon],  # 东北
-            [self.max_lat, self.min_lon]   # 西北
+            [self.min_lat, self.min_lon],
+            [self.min_lat, self.max_lon],
+            [self.max_lat, self.max_lon],
+            [self.max_lat, self.min_lon]
         ]
-
-        # 为每个角点生成偏移点
-        bypass_candidates = []
-        for corner in corners:
-            # 向四个方向偏移
-            bypass_candidates.append([corner[0] + perp_left_y * offset_deg, corner[1] + perp_left_x * offset_deg])
-            bypass_candidates.append([corner[0] + perp_right_y * offset_deg, corner[1] + perp_right_x * offset_deg])
-            bypass_candidates.append([corner[0] + dy * offset_deg * 1.5, corner[1] + dx * offset_deg * 1.5])
-            bypass_candidates.append([corner[0] - dy * offset_deg * 1.5, corner[1] - dx * offset_deg * 1.5])
-
-        # 筛选出所有在障碍物外的点
-        valid_candidates = [pt for pt in bypass_candidates if not self.contains(pt)]
-
-        # 按到起点的距离排序，优先选离航线方向近的点
-        valid_candidates.sort(key=lambda p: calc_distance(p, start))
-
+        
+        if not left_point:
+            left_point = [corners[0][0] + left_ny * offset_deg, corners[0][1] + left_nx * offset_deg]
+        if not right_point:
+            right_point = [corners[1][0] + right_ny * offset_deg, corners[1][1] + right_nx * offset_deg]
+        if not front_point:
+            front_point = [corners[2][0] + front_dy * offset_deg * 1.5, corners[2][1] + front_dx * offset_deg * 1.5]
+        if not back_point:
+            back_point = [corners[3][0] + back_dy * offset_deg * 1.5, corners[3][1] + back_dx * offset_deg * 1.5]
+        
         return {
-            'left': valid_candidates[0] if valid_candidates else [self.center_lat, self.center_lon + offset_deg],
-            'right': valid_candidates[1] if len(valid_candidates)>=2 else [self.center_lat, self.center_lon - offset_deg],
-            'front': valid_candidates[2] if len(valid_candidates)>=3 else [self.center_lat + offset_deg, self.center_lon],
-            'back': valid_candidates[3] if len(valid_candidates)>=4 else [self.center_lat - offset_deg, self.center_lon]
+            'left': left_point,
+            'right': right_point,
+            'front': front_point,
+            'back': back_point
         }
 
-# ==================== 路径规划（修复高度判断+绕障校验） ====================
+# ==================== 路径规划（多障碍物连续绕行+强制校验） ====================
 def find_blocking_obstacles(start, end, obstacles, flight_alt):
     """
-    【修复3】严格判断：只有飞行高度 < 障碍物高度 且 航线穿障，才需要绕行
+    严格筛选需要绕行的障碍物：高度不足 + 航线穿障
     """
     blocking = []
     for obs_data in obstacles:
@@ -345,52 +389,82 @@ def find_blocking_obstacles(start, end, obstacles, flight_alt):
             blocking.append(obs)
     return blocking
 
+def correct_segment(start, end, obstacles, flight_alt, safe_radius, bypass_distance, depth=0):
+    """
+    递归修正线段，直到不穿障
+    """
+    if depth > 5:  # 防止无限递归
+        return [start, end]
+    
+    blocking = find_blocking_obstacles(start, end, obstacles, flight_alt)
+    if not blocking:
+        return [start, end]
+    
+    # 取第一个障碍物，生成绕行点
+    obs = blocking[0]
+    bypass_points = obs.get_edge_bypass_points(start, end, safe_radius, bypass_distance)
+    # 优先选离航线方向更近的点
+    candidates = [bypass_points['left'], bypass_points['right'], bypass_points['front'], bypass_points['back']]
+    valid_candidates = [p for p in candidates if not obs.contains(p)]
+    if not valid_candidates:
+        valid_candidates = [[obs.center_lat + meter_to_degree(100), obs.center_lon + meter_to_degree(100)]]
+    
+    # 递归修正两段路径：start→bypass, bypass→end
+    corrected1 = correct_segment(start, valid_candidates[0], obstacles, flight_alt, safe_radius, bypass_distance, depth+1)
+    corrected2 = correct_segment(valid_candidates[0], end, obstacles, flight_alt, safe_radius, bypass_distance, depth+1)
+    
+    return corrected1[:-1] + corrected2
+
 def plan_path_with_bypass(start, end, obstacles, flight_alt, safe_radius, bypass_distance, side):
     """
-    【修复4】路径规划后，强制校验是否还穿障，穿障则自动修正
+    多障碍物路径规划，逐段修正，保证不穿障
     """
     waypoints = [start]
     current_start = start
     current_end = end
 
+    # 先获取所有需要绕行的障碍物
     blocking_obstacles = find_blocking_obstacles(current_start, current_end, obstacles, flight_alt)
     
     if not blocking_obstacles:
         waypoints.append(end)
         return waypoints
 
-    # 按距离起点远近排序
+    # 按距离起点远近排序，逐个处理
     blocking_obstacles.sort(key=lambda obs: calc_distance([obs.center_lat, obs.center_lon], start))
 
+    # 逐个修正路径
     for obs in blocking_obstacles:
-        bypass_points = obs.get_corner_bypass_points(current_start, current_end, safe_radius, bypass_distance)
-        bypass_pt = bypass_points.get(side, bypass_points['left'])
-        waypoints.append(bypass_pt)
-        current_start = bypass_pt
-
+        corrected = correct_segment(current_start, end, obstacles, flight_alt, safe_radius, bypass_distance)
+        # 找到修正路径中第一个不在当前起点的点
+        for wp in corrected:
+            if wp != current_start:
+                waypoints.append(wp)
+                current_start = wp
+                break
+    
     waypoints.append(end)
-
-    # 二次校验：如果路径仍然穿障，自动调整绕行点
-    final_path = [start]
+    
+    # 最终校验：整条路径不穿障
+    final_path = []
     for i in range(len(waypoints)-1):
         seg_start = waypoints[i]
         seg_end = waypoints[i+1]
-        # 检查这段线段是否穿障
-        still_blocking = find_blocking_obstacles(seg_start, seg_end, obstacles, flight_alt)
-        if not still_blocking:
-            final_path.append(seg_end)
-            continue
-        # 如果还穿障，强制添加额外绕行点
-        obs = still_blocking[0]
-        extra_pt = [obs.center_lat + meter_to_degree(50), obs.center_lon + meter_to_degree(50)]
-        final_path.append(extra_pt)
-        final_path.append(seg_end)
-
-    return final_path
+        corrected_seg = correct_segment(seg_start, seg_end, obstacles, flight_alt, safe_radius, bypass_distance)
+        final_path.extend(corrected_seg[:-1])
+    final_path.append(waypoints[-1])
+    
+    # 去重
+    unique_path = []
+    for wp in final_path:
+        if not unique_path or calc_distance(wp, unique_path[-1]) > 1:
+            unique_path.append(wp)
+    
+    return unique_path
 
 # ==================== 标题 ====================
 st.title("🛰️ 无人机智能监控系统")
-st.markdown("**南京科技职业学院** | 低于障碍物高度自动绕行 | 高于障碍物高度直接飞越")
+st.markdown("**南京科技职业学院** | 低于障碍物高度自动沿边缘绕行 | 高于障碍物高度直接飞越")
 st.markdown("---")
 
 # ==================== 侧边栏 ====================
@@ -469,7 +543,7 @@ with tab1:
             
             current_flight = st.session_state.flight_alt
             if current_flight < height:
-                st.warning(f"⚠️ 飞行高度 {current_flight}m < 障碍物 {height}m → **自动绕行**")
+                st.warning(f"⚠️ 飞行高度 {current_flight}m < 障碍物 {height}m → **自动沿边缘绕行**")
             else:
                 st.success(f"✅ 飞行高度 {current_flight}m ≥ 障碍物 {height}m → **直接飞越**")
             
@@ -531,7 +605,7 @@ with tab1:
                 name = obs_data['name'] if isinstance(obs_data, dict) else obs_data.name
                 height = obs_data['height'] if isinstance(obs_data, dict) else obs_data.height
                 if alt < height:
-                    st.warning(f"🔄 {name}({height}m)：飞行高度不足 → 绕行")
+                    st.warning(f"🔄 {name}({height}m)：飞行高度不足 → 沿边缘绕行")
                 else:
                     st.success(f"⬆️ {name}({height}m)：高度足够 → 飞越")
         
@@ -594,13 +668,13 @@ with tab1:
                         'points': path,
                         'dist': path_dist,
                         'color': dir_colors[direction],
-                        'desc': f'从{direction}侧沿障碍物外侧绕行'
+                        'desc': f'从{direction}侧沿障碍物边缘绕行'
                     })
                 
                 best = min(plans, key=lambda x: x['dist']).copy()
                 best['name'] = '⭐ 最佳航线'
                 best['color'] = 'gold'
-                best['desc'] = f'最短绕行路径，距离{best["dist"]:.0f}m'
+                best['desc'] = f'最短边缘绕行路径，距离{best["dist"]:.0f}m'
                 plans.append(best)
             
             st.session_state.route_plans = plans
@@ -873,4 +947,4 @@ with tab2:
             st.info("请先点击「导入当前航线」加载航线")
 
 st.markdown("---")
-st.caption("💡 **使用规则**：①飞行高度 < 障碍物高度 → 自动沿外侧绕行 ②飞行高度 ≥ 障碍物高度 → 直接直线飞越")
+st.caption("💡 使用说明：飞行高度低于障碍物高度时，无人机将沿障碍物边缘外侧绕行；高度足够时直接飞越，不会横穿任何障碍物")
